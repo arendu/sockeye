@@ -28,6 +28,7 @@ from . import convolution
 from . import rnn
 from . import transformer
 from . import utils
+import pdb
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +332,32 @@ class FactorConfig(config.Config):
         self.num_embed = num_embed
 
 
+class SubwordComposerEncoderConfig(config.Config):
+    """
+    Convolutional encoder configuration.
+
+    :param cnn_config: CNN configuration.
+    :param num_layers: The number of convolutional layers on top of the embeddings.
+    :param positional_embedding_type: The type of positional embedding.
+    :param dtype: Data type.
+    """
+
+    def __init__(self,
+                 num_embed: int,
+                 max_seq_len_source: int,
+                 cnn_config: convolution.ConvolutionConfig,
+                 num_layers: int,
+                 positional_embedding_type: str,
+                 dtype: str = C.DTYPE_FP32) -> None:
+        super().__init__()
+        self.num_embed = num_embed
+        self.num_layers = num_layers
+        self.cnn_config = cnn_config
+        self.max_seq_len_source = max_seq_len_source
+        self.positional_embedding_type = positional_embedding_type
+        self.dtype = dtype
+
+
 class EmbeddingConfig(config.Config):
 
     def __init__(self,
@@ -348,8 +375,54 @@ class EmbeddingConfig(config.Config):
         self.num_factors = 1
         if self.factor_configs is not None:
             self.num_factors += len(self.factor_configs)
+        self.num_decomps = 0
         self.source_factors_combine = source_factors_combine
         self.dtype = dtype
+
+
+class SubwordComposerEncoder(Encoder):
+    def __init__(self,
+                 config: SubwordComposerEncoderConfig,
+                 prefix: str = "SubwordComposerEncoder") -> None:
+        super().__init__(config.dtype)
+        self.i2h_weight = mx.sym.Variable('%si2h_weight' % prefix)
+        self.layers = [convolution.ConvolutionBlock(
+            config.cnn_config,
+            pad_type='centered',
+            prefix="%s%d_" % (prefix, i)) for i in range(config.num_layers)]
+
+    def encode(self,
+               data: mx.sym.Symbol,
+               data_length: Optional[mx.sym.Symbol],
+               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
+        """
+        This should return an encoding for each word (so the first axis is batch size * max sentence length). Or maybe it will just be (batch size * sum of actual sentence lengths, if that's easy to do on the calling side). It will return something with the same first axis length and individual word embeddings along the second axis.
+
+        TODO: we should be able to cache these! As a preprocessing step for training, and incrementally during training.
+
+        :param data: Shape (batch size * max sentence length, max decomp length, 1)
+        :param data_length: Shape: (batch size * max sent len) containing the number of decomp features for each word
+        :param seq_len: Maximum number of decompositional features
+        """
+        data = mx.sym.FullyConnected(data=data,
+                                     num_hidden=self.config.cnn_config.num_hidden,
+                                     no_bias=True,
+                                     flatten=False,
+                                     weight=self.i2h_weight)
+
+        # Multiple layers with residual connections:
+        for layer in self.layers:
+            data = data + layer(data, data_length, seq_len)
+        return data, data_length, seq_len
+
+    def get_num_hidden(self) -> int:
+        return self.config.cnn_config.num_hidden #TODO: should be changed
+
+    def get_encoded_seq_len(self, seq_len: int) -> int:
+        pass
+
+    def get_max_seq_len(self) -> Optional[int]:
+        pass
 
 
 class Embedding(Encoder):
@@ -366,16 +439,20 @@ class Embedding(Encoder):
                  config: EmbeddingConfig,
                  prefix: str,
                  embed_weight: Optional[mx.sym.Symbol] = None,
+                 composer: Optional[Encoder] = None,
                  is_source: bool = False) -> None:
         super().__init__(config.dtype)
         self.config = config
         self.prefix = prefix
         self.embed_weight = embed_weight
+        self.composer = composer
         self.is_source = is_source
 
         if self.embed_weight is None:
             self.embed_weight = mx.sym.Variable(prefix + "weight",
                                                 shape=(self.config.vocab_size, self.config.num_embed))
+
+        # TODO: add check that composer is defined iff there are associated decomp factors and configs
 
         self.embed_factor_weights = []  # type: List[mx.sym.Symbol]
         if self.config.factor_configs is not None:
@@ -386,7 +463,7 @@ class Embedding(Encoder):
 
     def encode(self,
                data: mx.sym.Symbol,
-               data_length: Optional[mx.sym.Symbol],
+               data_length: mx.sym.Symbol,
                seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
         """
         Encodes data given sequence lengths of individual examples and maximum sequence length.
@@ -399,9 +476,13 @@ class Embedding(Encoder):
         factor_embeddings = []  # type: List[mx.sym.Symbol]
         if self.is_source:
             data, *data_factors = mx.sym.split(data=data,
-                                               num_outputs=self.config.num_factors,
+                                               num_outputs=self.config.num_factors,  # +self.config.max_decomp_size,
                                                axis=2,
                                                squeeze_axis=True, name=self.prefix + "factor_split")
+
+            data_decomps = data_factors[:self.config.num_factors]
+            assert len(data_decomps) == self.config.num_factors - 1  # TODO: forcing factors to be decomps
+            data_factors = data_factors[self.config.num_factors:]
 
             if self.config.factor_configs is not None:
                 for i, (factor_data, factor_config, factor_weight) in enumerate(zip(data_factors,
@@ -413,16 +494,54 @@ class Embedding(Encoder):
                                                               output_dim=factor_config.num_embed,
                                                               name=self.prefix + "factor%d_embed" % i))
 
+        # Produce embedding for factor 0 (the input tokens)
+        # TODO: maybe don't compute this (for decomp)
         embedding = mx.sym.Embedding(data=data,
                                      input_dim=self.config.vocab_size,
                                      weight=self.embed_weight,
                                      output_dim=self.config.num_embed,
                                      name=self.prefix + "embed")
 
+        if self.composer is not None and self.is_source:
+            # This needs to compute reshaped_data_decomps into something of shape
+            # (batch size * sum of sentence lengths, decomp features)
+            # We also need to compute decomp_lengths, of shape (batch size * sum of sentence lengths),
+            # which contains the number of decomp features for each word
+
+            # concatenate the shapes we just split into a single symbol of shape (batch size, sentence length, max number of decomps)
+            data_decomps = [d.expand_dims(2) for d in data_decomps]
+            decomp_input = mx.sym.concat(*data_decomps, dim=2) # may need to call expand_dims on each item first to create a third axis
+            # reshape to multiply the first two dimensions together (so each row is a word)
+            decomp_input = mx.sym.reshape(data=decomp_input, shape=(-3, 0)) #shape=(bs * sl, fac)
+            #decomp_input = decomp_input.reshape((1123, 1123, 113))
+
+            decomp_lengths = mx.sym.ones_like(data=decomp_input, name="ones_len")
+            decomp_lengths, *_ = mx.sym.split(data=decomp_lengths,
+                                              num_outputs=self.config.num_factors - 1,
+                                              axis=1,
+                                              squeeze_axis=True,
+                                              name=self.prefix + "decomp_lengths")
+            decomp_lengths.__mul__(self.config.num_factors - 1)
+            # embed each word from its pieces. Resulting shape: (batch * max sentence length, word embedding size)
+            decomp_encoded = mx.sym.Embedding(data=decomp_input,
+                                              input_dim=100,
+                                              weight=None,
+                                              output_dim=self.config.num_embed,
+                                              name=self.prefix + "composer_embed")
+            (decomp_encoded,
+             decomp_encoded_lengths,
+             decomp_encoded_seq_len) = self.composer.encode(decomp_encoded, decomp_lengths, self.config.num_factors - 1)
+            decomp_encoded = mx.sym.max(data=decomp_encoded, axis=1, name=self.prefix + "sum_composer")
+            # reshape to (batch size, max sentence length, word embedding size)
+            decomp_encoded = mx.sym.reshape_like(decomp_encoded, embedding)
+
+            # TODO: combine in other ways?
+            embedding = mx.sym.add_n(*[embedding, decomp_encoded], name=self.prefix + "plus_decomp_encoded_embeddings")
+
         if self.config.factor_configs is not None:
             if self.config.source_factors_combine == C.SOURCE_FACTORS_COMBINE_CONCAT:
                 embedding = mx.sym.concat(embedding, *factor_embeddings, dim=2, name=self.prefix + "embed_plus_factors")
-            else:
+            elif self.config.source_factors_combine == C.SOURCE_FACTORS_COMBINE_SUM:
                 embedding = mx.sym.add_n(embedding, *factor_embeddings, name=self.prefix + "embed_plus_factors")
 
         if self.config.dropout > 0:

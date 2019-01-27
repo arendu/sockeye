@@ -23,6 +23,7 @@ if __name__ == "__main__":
 
 
 import argparse
+import copy
 import os
 import shutil
 import sys
@@ -55,6 +56,7 @@ from .config import Config
 from .log import setup_main_logger
 from .optimizers import OptimizerConfig
 from .utils import check_condition
+import pdb
 
 # Temporary logger, the real one (logging to a file probably, will be created in the main function)
 logger = setup_main_logger(__name__, file_logging=False, console=True)
@@ -634,6 +636,9 @@ def create_model_config(args: argparse.Namespace,
 
     config_encoder, encoder_num_hidden = create_encoder_config(args, max_seq_len_source, max_seq_len_target,
                                                                config_conv)
+    config_composer_encoder = copy.deepcopy(config_encoder)
+    config_composer_encoder.num_layers = 1
+    config_composer_encoder.attention_heads = 1
     config_decoder = create_decoder_config(args, encoder_num_hidden, max_seq_len_source, max_seq_len_target)
 
     source_factor_configs = None
@@ -664,6 +669,7 @@ def create_model_config(args: argparse.Namespace,
                                      config_encoder=config_encoder,
                                      config_decoder=config_decoder,
                                      config_loss=config_loss,
+                                     config_composer_encoder=config_composer_encoder,
                                      weight_tying=args.weight_tying,
                                      weight_tying_type=args.weight_tying_type if args.weight_tying else None,
                                      weight_normalization=args.weight_normalization,

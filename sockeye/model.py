@@ -27,6 +27,7 @@ from . import encoder
 from . import layers
 from . import loss
 from . import utils
+import pdb
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class ModelConfig(Config):
                  config_encoder: encoder.EncoderConfig,
                  config_decoder: decoder.DecoderConfig,
                  config_loss: loss.LossConfig,
+                 config_composer_encoder: Optional[encoder.EncoderConfig] = None,
                  weight_tying: bool = False,
                  weight_tying_type: Optional[str] = C.WEIGHT_TYING_TRG_SOFTMAX,
                  weight_normalization: bool = False,
@@ -71,6 +73,7 @@ class ModelConfig(Config):
         self.config_embed_target = config_embed_target
         self.config_encoder = config_encoder
         self.config_decoder = config_decoder
+        self.config_composer_encoder = config_composer_encoder
         self.config_loss = config_loss
         self.weight_tying = weight_tying
         self.weight_tying_type = weight_tying_type
@@ -112,9 +115,14 @@ class SockeyeModel:
         if isinstance(self.config.config_embed_source, encoder.PassThroughEmbeddingConfig):
             self.embedding_source = encoder.PassThroughEmbedding(self.config.config_embed_source)  # type: encoder.Encoder
         else:
+            if self.config.config_composer_encoder is not None:
+                composer = encoder.get_transformer_encoder(self.config.config_composer_encoder, "composer")
+            else:
+                composer = None
             self.embedding_source = encoder.Embedding(self.config.config_embed_source,
                                                       prefix=self.prefix + C.SOURCE_EMBEDDING_PREFIX,
                                                       embed_weight=embed_weight_source,
+                                                      composer=composer,
                                                       is_source=True)  # type: encoder.Encoder
 
         self.embedding_target = encoder.Embedding(self.config.config_embed_target,
